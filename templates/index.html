@@ -1,0 +1,1791 @@
+<script>
+const AVC = [
+  ["#d1fae5","#065f46"],
+  ["#dbeafe","#1e40af"],
+  ["#ede9fe","#5b21b6"],
+  ["#fef3c7","#92400e"],
+  ["#ffedd5","#9a3412"],
+  ["#fce7f3","#9d174d"],
+  ["#e5e7eb","#111827"],
+];
+const avS = id => {
+  const c = AVC[(id || 1) % AVC.length];
+  return `background:${c[0]};color:${c[1]};`;
+};
+const ini = (p,n) => (p?.[0] || "") + (n?.[0] || "");
+
+function fD(d) {
+  if (!d) return "";
+  const [y,m,j] = d.split("-");
+  return `${j}/${m}/${y}`;
+}
+function dys(a,b) {
+  const v = Math.round((new Date(b) - new Date(a)) / 86400000) + 1;
+  return v > 0 ? v : 1;
+}
+function esc(s) {
+  s = String(s || "");
+  return s
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;");
+}
+const TODAY = new Date().toISOString().slice(0,10);
+
+let ME = null, employees = [], conges = [], absences = [], users = [], dashData = null;
+
+const BC = {
+  "CDI":"bcdi",
+  "CDD":"bcdd",
+  "Alternant":"balt",
+  "Autoentrepreneur":"bae",
+  "Stagiaire":"bstg",
+  "Contrat pro":"bcp"
+};
+const BS = {
+  "En attente":"batt",
+  "Approuvé":"bapp",
+  "Refus":"bref"
+};
+const BT = {
+  "Maladie":"bmal",
+  "RTT":"bae",
+  "Congés pays":"bapp",
+  "Congé maternité":"bpu",
+  "Congé paternité":"bbl",
+  "Congé exceptionnel":"balt",
+  "Demi-journée":"bstg",
+  "Autre":"btyp"
+};
+
+function seniorityLabel(debut) {
+  if (!debut) return null;
+  const d0 = new Date(debut);
+  if (isNaN(d0)) return null;
+  const now = new Date();
+  let years = now.getFullYear() - d0.getFullYear();
+  let months = now.getMonth() - d0.getMonth();
+  if (months < 0) {
+    years -= 1;
+    months += 12;
+  }
+  if (years < 0) return null;
+  const pa = years > 1 ? "ans" : "an";
+  const pm = "mois";
+  if (years === 0 && months === 0) return "Moins d'un mois";
+  if (years === 0) return `${months} ${pm} d'ancienneté`;
+  if (months === 0) return `${years} ${pa} d'ancienneté`;
+  return `${years} ${pa} et ${months} ${pm} d'ancienneté`;
+}
+
+function myCongesByMonth(empId) {
+  const map = {};
+  const now = new Date();
+  const sixMonthsAgo = new Date(now);
+  sixMonthsAgo.setMonth(now.getMonth() - 5);
+  for (const c of conges || []) {
+    if (c.empid !== empId) continue;
+    const d = c.debut ? new Date(c.debut) : null;
+    if (!d || isNaN(d) || d < sixMonthsAgo) continue;
+    const ym = d.toISOString().slice(0,7);
+    if (!map[ym]) map[ym] = { mois: ym, total: 0, approuves: 0 };
+    map[ym].total += 1;
+    if (c.statut === "Approuvé") map[ym].approuves += 1;
+  }
+  return Object.values(map).sort((a,b) => a.mois.localeCompare(b.mois));
+}
+function myCongesByType(empId) {
+  const map = {};
+  for (const c of conges || []) {
+    if (c.empid !== empId) continue;
+    const key = c.type || "Autre";
+    if (!map[key]) map[key] = { type: key, total: 0, approuves: 0 };
+    map[key].total += 1;
+    if (c.statut === "Approuvé") map[key].approuves += 1;
+  }
+  return Object.values(map).sort((a,b) => a.type.localeCompare(b.type));
+}
+
+async function api(url, method="GET", body=null) {
+  const opt = { method, headers: { "Content-Type":"application/json" } };
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(url, opt);
+  if (r.status === 401) {
+    window.location.href = "/login";
+    return null;
+  }
+  const data = await r.json();
+  if (!r.ok && data && data.error) {
+    alert(data.error);
+    return null;
+  }
+  return data;
+}
+
+function toast(msg) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+async function init() {
+  ME = await api("/api/me");
+  if (!ME) return;
+  setupSidebar();
+  setupTopbar();
+  await loadData();
+  const defaultTab = ME.current_user.role === "employe" ? "monespace" : "dashboard";
+  showTab(defaultTab);
+  if (ME.current_user && ME.current_user.must_change_pw) {
+    openModal("changePass");
+    toast("Veuillez changer votre mot de passe avant de continuer");
+  }
+}
+
+function setupSidebar() {
+  const rl = { directeur:"Directeur", rh:"Responsable RH", employe:"Employé" };
+  document.getElementById("user-name").textContent = ME.current_user.login;
+  document.getElementById("user-role-lbl").textContent = rl[ME.current_user.role] || ME.current_user.role;
+  document.getElementById("user-av").textContent = ME.current_user.login.slice(0,2).toUpperCase();
+
+  let items = "";
+  if (ME.current_user.role === "employe") {
+    items = `
+      <div class="sb-sec">Mon espace</div>
+      <div class="sb-item" id="nav-monespace" onclick="showTab('monespace')"><span class="sb-ic">👤</span>Ma fiche</div>
+      <div class="sb-item" id="nav-mesconges" onclick="showTab('mesconges')"><span class="sb-ic">📅</span>Mes congés <span class="sb-dot" id="badge-att" style="display:none;">0</span></div>
+      <div class="sb-item" id="nav-mesabsences" onclick="showTab('mesabsences')"><span class="sb-ic">🚫</span>Mes absences</div>
+    `;
+  } else {
+    items = `
+      <div class="sb-sec">Tableau de bord</div>
+      <div class="sb-item" id="nav-dashboard" onclick="showTab('dashboard')"><span class="sb-ic">📊</span>Dashboard <span class="sb-dot" id="badge-att" style="display:none;">0</span></div>
+      <div class="sb-sec">Gestion RH</div>
+      <div class="sb-item" id="nav-annuaire" onclick="showTab('annuaire')"><span class="sb-ic">👥</span>Annuaire RH</div>
+      <div class="sb-item" id="nav-conges" onclick="showTab('conges')"><span class="sb-ic">📅</span>Congés</div>
+      <div class="sb-item" id="nav-absences" onclick="showTab('absences')"><span class="sb-ic">🚫</span>Absences</div>
+    `;
+    if (ME.current_user.role === "directeur") {
+      items += `
+        <div class="sb-sec">Administration</div>
+        <div class="sb-item" id="nav-users" onclick="showTab('users')"><span class="sb-ic">🔐</span>Comptes accès</div>
+      `;
+      document.getElementById("btn-export").style.display = "flex";
+    }
+  }
+  document.getElementById("sidebar-nav").innerHTML = items;
+}
+
+function setupTopbar() {
+  const pill = document.getElementById("role-pill");
+  const rl = { directeur:"Directeur", rh:"RH", employe:"Employé" };
+  const cl = { directeur:"role-directeur", rh:"role-rh", employe:"role-employe" };
+  pill.textContent = rl[ME.current_user.role] || ME.current_user.role;
+  pill.className = "role-pill " + (cl[ME.current_user.role] || "");
+}
+
+async function loadData() {
+  if (ME.current_user.role === "employe") {
+    conges = await api("/api/conges") || [];
+    absences = await api("/api/absences") || [];
+    employees = ME.employee ? [ME.employee] : [];
+  } else {
+    const [emps, cg, abs, dash] = await Promise.all([
+      api("/api/employees"),
+      api("/api/conges"),
+      api("/api/absences"),
+      api("/api/dashboard")
+    ]);
+    employees = emps || [];
+    conges = cg || [];
+    absences = abs || [];
+    dashData = dash || null;
+    if (ME.current_user.role === "directeur") {
+      users = await api("/api/users") || [];
+    }
+  }
+  updateBadge();
+}
+
+function updateBadge() {
+  const n = conges.filter(c => c.statut === "En attente").length;
+  const b = document.getElementById("badge-att");
+  if (!b) return;
+  b.textContent = n;
+  b.style.display = n ? "inline" : "none";
+}
+
+function showTab(tab) {
+  document.querySelectorAll(".sb-item").forEach(x => x.classList.remove("on"));
+  const navEl = document.getElementById("nav-" + tab);
+  if (navEl) navEl.classList.add("on");
+
+  const titles = {
+    dashboard:"Tableau de bord",
+    annuaire:"Annuaire RH",
+    conges:"Congés / Demandes",
+    absences:"Journal des absences",
+    users:"Comptes accès",
+    monespace:"Ma fiche",
+    mesconges:"Mes congés",
+    mesabsences:"Mes absences"
+  };
+  document.getElementById("tb-title").textContent = titles[tab] || "";
+
+  const acts = document.getElementById("tb-actions");
+  const pages = document.getElementById("pages");
+  acts.innerHTML = "";
+  pages.innerHTML = "";
+
+  if (tab === "dashboard") buildDashboard(pages, acts);
+  else if (tab === "annuaire") buildAnnuaire(pages, acts);
+  else if (tab === "conges") buildConges(pages, acts);
+  else if (tab === "absences") buildAbsences(pages, acts);
+  else if (tab === "users") buildUsers(pages, acts);
+  else if (tab === "monespace") buildMonEspace(pages, acts);
+  else if (tab === "mesconges") buildMesConges(pages, acts);
+  else if (tab === "mesabsences") buildMesAbsences(pages, acts);
+}
+
+/* ───────────────────────── Dashboard ───────────────────────── */
+
+function buildDashboard(pages, acts) {
+  acts.innerHTML = `
+    <button class="btn bg" onclick="openModal('newEmp')">Collaborateur</button>
+    <button class="btn bbl" onclick="openModal('newConge')">Congé</button>
+    <button class="btn bpu" onclick="openModal('newAbs')">Absence</button>
+  `;
+  const d = dashData || {};
+  const s = d.stats || {};
+
+  const statsHtml = [
+    ["Total collaborateurs", s.total_emp || 0, "#e8f8f3", "var(--ink)"],
+    ["CDI", s.cdi || 0, "#e8f8f3", "var(--ink)"],
+    ["CDD", s.cdd || 0, "#eff6ff", "var(--bl)"],
+    ["Alternants", s.alt || 0, "#f5f3ff", "var(--pu)"],
+    ["Autoentrepreneurs", s.ae || 0, "#fffbeb", "var(--am)"],
+    ["Congés en attente", s.att || 0, "#fffbeb", s.att ? "var(--am)" : "var(--ink)"],
+    ["Absences ce mois", s.abs_mois || 0, "#fef2f2", s.abs_mois ? "var(--rd)" : "var(--ink)"],
+    ["Congés ce mois", s.conges_mois || 0, "#e8f8f3", "var(--g)"],
+    ["Ancienneté moyenne", (s.avg_seniority_years || 0) + " ans", "#e5e7eb", "var(--ink)"],
+    ["≥ 5 ans d'ancienneté", (s.pct_five_plus || 0) + " %", "#ede9fe", "var(--pu)"],
+  ].map(([label,val,bg,col]) => `
+    <div class="sc" style="--scb:${bg};--scv:${col};">
+      <div class="sc-lbl">${label}</div>
+      <div class="sc-val">${val}</div>
+    </div>
+  `).join("");
+
+  const monthly = d.monthly || [];
+  const maxVal = monthly.length ? Math.max(...monthly.map(m => m.total), 1) : 1;
+  const chartHtml = monthly.length ? `
+    <div style="padding:14px 16px;">
+      <div style="font-size:11px;font-weight:600;color:var(--ink4);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px;">
+        Congés par mois
+      </div>
+      <div class="chart-wrap">
+        ${monthly.map(m => {
+          const h = Math.round(m.total / maxVal * 60);
+          const ha = Math.round(m.approuves / maxVal * 60);
+          const lbl = m.mois.slice(5);
+          return `
+            <div class="bar-group">
+              <div class="bar-inner">
+                <div class="bar" style="height:${h}px;background:#bfdbfe;width:16px;" title="Total: ${m.total}"></div>
+                <div class="bar" style="height:${ha}px;background:var(--g);width:16px;" title="Approuvés: ${m.approuves}"></div>
+              </div>
+              <div class="bar-lbl">${lbl}</div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+      <div style="display:flex;gap:16px;font-size:11px;color:var(--ink3);margin-top:8px;padding:0 4px;">
+        <span style="display:flex;align-items:center;gap:5px;">
+          <span style="width:10px;height:10px;background:#bfdbfe;border-radius:2px;display:inline-block;"></span>
+          Total
+        </span>
+        <span style="display:flex;align-items:center;gap:5px;">
+          <span style="width:10px;height:10px;background:var(--g);border-radius:2px;display:inline-block;"></span>
+          Approuvés
+        </span>
+      </div>
+    </div>
+  ` : `
+    <div class="empty">
+      <div class="ei">📊</div>
+      <div class="et">Pas encore de données</div>
+    </div>
+  `;
+
+  const exp = d.expiring || [];
+  const expHtml = exp.length ? `
+    <div class="alert-card alert-danger">
+      <div class="alert-title">Fins de contrat dans les 60 jours</div>
+      ${exp.map(e => {
+        const daysLeft = Math.round((new Date(e.date_fin) - new Date()) / 86400000);
+        const urgentColor = daysLeft <= 30 ? "#b91c1c" : "#d97706";
+        return `
+          <div class="alert-row">
+            <span style="font-weight:600;">${esc(e.prenom)} ${esc(e.nom)}</span>
+            <span style="color:var(--ink3);">${esc(e.contrat)} · ${esc(e.poste || "")}</span>
+            <span style="font-weight:600;color:${urgentColor};">
+              J-${daysLeft} · ${fD(e.date_fin)}
+            </span>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  ` : `
+    <div class="alert-card alert-danger">
+      <div class="alert-title">Fins de contrat dans les 60 jours</div>
+      <div style="font-size:12px;color:var(--ink4);padding:8px 0;">
+        Aucune fin de contrat imminente
+      </div>
+    </div>
+  `;
+
+  const pending = d.pending || [];
+  const pendingHtml = pending.length ? pending.map(c => `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--s3);gap:8px;flex-wrap:wrap;">
+      <div>
+        <div style="font-weight:600;font-size:13px;">${esc(c.emp_nom)}</div>
+        <div style="font-size:11px;color:var(--ink3);">
+          ${esc(c.type || "")} ${fD(c.debut)} → ${fD(c.fin)} · ${dys(c.debut,c.fin)} j
+          ${c.motif ? " · " + esc(c.motif) : ""}
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;">
+        <button class="btn bap bsm" onclick="approuverCg(${c.id}, 'Approuvé')">Approuver</button>
+        <button class="btn brj bsm" onclick="openRefusModal(${c.id})">Refuser</button>
+      </div>
+    </div>
+  `).join("") : `
+    <div class="empty" style="padding:20px;">
+      <div class="ei">✅</div>
+      <div class="et">Aucune demande en attente</div>
+    </div>
+  `;
+
+  pages.innerHTML = `
+    <div class="page">
+      <div class="dash-grid">
+        ${statsHtml}
+      </div>
+      <div class="dash-row">
+        <div class="card">
+          <div class="ch">
+            <div class="ch-l">
+              <div class="ch-ic" style="background:#e8f8f3"></div>
+              <div>
+                <div class="ch-title">Congés par mois</div>
+                <div class="ch-sub">${monthly.length ? "6 derniers mois" : "Pas encore de données"}</div>
+              </div>
+            </div>
+          </div>
+          ${chartHtml}
+        </div>
+        <div>
+          ${expHtml}
+          <div class="card" style="margin-top:0;">
+            <div class="ch">
+              <div class="ch-l">
+                <div class="ch-ic" style="background:#fffbeb"></div>
+                <div>
+                  <div class="ch-title">Demandes en attente</div>
+                  <div class="ch-sub">${pending.length} à traiter</div>
+                </div>
+              </div>
+            </div>
+            <div style="padding:0 16px;">
+              ${pendingHtml}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ───────────────────────── Annuaire RH ─────────────────────── */
+
+function buildAnnuaire(pages, acts) {
+  acts.innerHTML = `
+    <button class="btn bg" onclick="openModal('newEmp')">Collaborateur</button>
+    <button class="btn bgh" onclick="openModal('importEmp')" style="margin-left:8px;">Import Excel</button>
+  `;
+  pages.innerHTML = `
+    <div class="page">
+      <div class="card">
+        <div class="ch">
+          <div class="ch-l">
+            <div class="ch-ic" style="background:#e8f8f3"></div>
+            <div>
+              <div class="ch-title">Collaborateurs actifs</div>
+              <div class="ch-sub">${employees.length} personnes</div>
+            </div>
+          </div>
+        </div>
+        <div class="mb">
+          <div class="filt">
+            <input class="fi" id="search" placeholder="Rechercher..." oninput="filterEmp()" style="min-width:180px">
+            <select class="fi" id="fc-f" onchange="filterEmp()">
+              <option value="">Tous les contrats</option>
+              <option>CDI</option>
+              <option>CDD</option>
+              <option>Alternant</option>
+              <option>Autoentrepreneur</option>
+              <option>Stagiaire</option>
+              <option>Contrat pro</option>
+            </select>
+            <select class="fi" id="fc-anc" onchange="filterEmp()">
+              <option value="">Toute ancienneté</option>
+              <option value="lt2">&lt; 2 ans</option>
+              <option value="2to5">2 à 5 ans</option>
+              <option value="gte5">≥ 5 ans</option>
+            </select>
+            <select class="fi" id="fc-sort" onchange="filterEmp()">
+              <option value="">Tri par défaut</option>
+              <option value="anc-desc">Ancienneté décroissante</option>
+              <option value="anc-asc">Ancienneté croissante</option>
+            </select>
+          </div>
+          <div class="tw">
+            <table>
+              <thead>
+                <tr>
+                  <th>Collaborateur</th>
+                  <th>Poste</th>
+                  <th>Contrat</th>
+                  <th>Ancienneté</th>
+                  <th>Solde CP</th>
+                  <th>Fin contrat</th>
+                  <th>Email</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="emp-tb"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  filterEmp();
+}
+
+function filterEmp() {
+  const q = document.getElementById("search").value.toLowerCase();
+  const fc = document.getElementById("fc-f").value;
+  const fac = document.getElementById("fc-anc").value;
+  const sort = document.getElementById("fc-sort").value;
+  const today = new Date();
+
+  let list = employees.filter(e => {
+    const matchText = !q || ((e.prenom + " " + e.nom + " " + (e.poste || "")).toLowerCase().includes(q));
+    const matchContrat = !fc || e.contrat === fc;
+    let matchAnc = true;
+    if (fac) {
+      let years = null;
+      if (e.debut) {
+        const d0 = new Date(e.debut);
+        if (!isNaN(d0)) {
+          const deltaDays = (today - d0) / 86400000;
+          years = deltaDays / 365.0;
+        }
+      }
+      if (years === null || years < 0) {
+        matchAnc = false;
+      } else if (fac === "lt2") {
+        matchAnc = years < 2;
+      } else if (fac === "2to5") {
+        matchAnc = years >= 2 && years < 5;
+      } else if (fac === "gte5") {
+        matchAnc = years >= 5;
+      }
+    }
+    return matchText && matchContrat && matchAnc;
+  });
+
+  if (sort === "anc-desc" || sort === "anc-asc") {
+    list = list.slice().sort((a,b) => {
+      const da = a.debut ? new Date(a.debut) : null;
+      const db = b.debut ? new Date(b.debut) : null;
+      if (!da && !db) return 0;
+      if (!da) return 1;
+      if (!db) return -1;
+      return sort === "anc-desc" ? (da - db) : (db - da);
+    });
+  }
+  renderEmpTable(list);
+}
+
+function renderEmpTable(f) {
+  const today = new Date();
+  const tb = document.getElementById("emp-tb");
+  if (!tb) return;
+  tb.innerHTML = f.length ? f.map(e => {
+    const finAlerte = e.date_fin && ((new Date(e.date_fin) - today) / 86400000) <= 60;
+    const senior = seniorityLabel(e.debut);
+    const solde = e.solde_cp ?? 0;
+    return `
+      <tr>
+        <td>
+          <div class="nc">
+            <div class="av" style="${avS(e.id)}">${ini(e.prenom, e.nom)}</div>
+            <span class="nm">${esc(e.prenom)} ${esc(e.nom)}</span>
+          </div>
+        </td>
+        <td style="color:var(--ink3);font-size:13px;">${esc(e.poste || "")}</td>
+        <td><span class="bdg BC ${BC[e.contrat] || "bcd"}">${esc(e.contrat || "")}</span></td>
+        <td style="color:var(--ink3);font-size:12px;">${senior ? esc(senior) : "-"}</td>
+        <td><span style="font-weight:600;color:${solde <= 0 ? "var(--rd)" : "var(--g)"};">${solde} j</span></td>
+        <td style="font-size:12px;color:${finAlerte ? "var(--rd)" : "var(--ink4)"};font-weight:${finAlerte ? 600 : 400};">
+          ${e.date_fin ? fD(e.date_fin) : ""}
+        </td>
+        <td style="color:var(--ink3);font-size:12px;font-family:'JetBrains Mono',monospace;">
+          ${esc(e.email || "")}
+        </td>
+        <td style="text-align:right;white-space:nowrap;">
+          <button class="btn bgh bsm" onclick="openModal('viewEmp', ${e.id})">Fiche</button>
+          <button class="btn bgh bsm" onclick="openModal('editEmp', ${e.id})" style="margin-left:4px;">Éditer</button>
+        </td>
+      </tr>
+    `;
+  }).join("") : `
+    <tr>
+      <td colspan="8">
+        <div class="empty">
+          <div class="ei">🤷‍♂️</div>
+          <div class="et">Aucun résultat</div>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+/* ───────────────────────── Congés RH ──────────────────────── */
+
+function buildConges(pages, acts) {
+  acts.innerHTML = `
+    <button class="btn bbl" onclick="openModal('newConge')">Demande</button>
+    <button class="btn bgh" onclick="openModal('importCA')" style="margin-left:8px;">Import congés/absences</button>
+  `;
+  const att = conges.filter(c => c.statut === "En attente").length;
+  pages.innerHTML = `
+    <div class="page">
+      <div class="card">
+        <div class="ch">
+          <div class="ch-l">
+            <div class="ch-ic" style="background:#fffbeb"></div>
+            <div>
+              <div class="ch-title">Demandes de congé</div>
+              <div class="ch-sub">${att} en attente · ${conges.length} total</div>
+            </div>
+          </div>
+        </div>
+        <div class="mb">
+          <div class="tw">
+            <table>
+              <thead>
+                <tr>
+                  <th>Collaborateur</th>
+                  <th>Type</th>
+                  <th>Du</th>
+                  <th>Au</th>
+                  <th>Jours</th>
+                  <th>Créneau</th>
+                  <th>Motif</th>
+                  <th>Statut</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="cg-tb"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  renderCgTable(conges);
+}
+
+function renderCgTable(f) {
+  const tb = document.getElementById("cg-tb");
+  if (!tb) return;
+  const crn = { journee:"Journée", matin:"Matin", apm:"Après-midi" };
+  tb.innerHTML = f.length ? f.map(c => `
+    <tr>
+      <td style="font-weight:600;font-size:13px;">${esc(c.emp_nom)}</td>
+      <td><span class="bdg BT ${BT[c.type] || "btyp"}">${esc(c.type || "")}</span></td>
+      <td style="color:var(--ink2);">${fD(c.debut)}</td>
+      <td style="color:var(--ink2);">${fD(c.fin)}</td>
+      <td><div class="dpill">${dys(c.debut,c.fin)}</div></td>
+      <td style="font-size:11px;color:var(--ink3);">${crn[c.creneau] || "Journée"}</td>
+      <td style="color:var(--ink3);font-size:12px;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(c.motif || "")}</td>
+      <td>
+        <span class="bdg BS ${BS[c.statut] || "batt"}">${esc(c.statut)}</span>
+        ${c.statut === "Refus" && c.note_refus ? `
+          <div style="font-size:10px;color:var(--rd);margin-top:3px;">${esc(c.note_refus)}</div>
+        ` : ""}
+      </td>
+      <td style="white-space:nowrap;">
+        ${c.statut === "En attente" ? `
+          <button class="btn bap bsm" onclick="approuverCg(${c.id}, 'Approuvé')">Approuver</button>
+          <button class="btn brj bsm" onclick="openRefusModal(${c.id})" style="margin-left:4px;">Refuser</button>
+        ` : `<span style="color:var(--ink4);font-size:12px;">-</span>`}
+      </td>
+    </tr>
+  `).join("") : `
+    <tr>
+      <td colspan="9">
+        <div class="empty">
+          <div class="ei">🗓️</div>
+          <div class="et">Aucune demande</div>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+/* ───────────────────────── Absences RH ───────────────────── */
+
+function buildAbsences(pages, acts) {
+  acts.innerHTML = `<button class="btn bpu" onclick="openModal('newAbs')">Absence</button>`;
+  pages.innerHTML = `
+    <div class="page">
+      <div class="card">
+        <div class="ch">
+          <div class="ch-l">
+            <div class="ch-ic" style="background:#f5f3ff"></div>
+            <div>
+              <div class="ch-title">Journal des absences</div>
+              <div class="ch-sub">${absences.length} enregistrement${absences.length > 1 ? "s" : ""}</div>
+            </div>
+          </div>
+        </div>
+        <div class="mb">
+          <div class="tw">
+            <table>
+              <thead>
+                <tr>
+                  <th>Collaborateur</th>
+                  <th>Date</th>
+                  <th>Type</th>
+                  <th>Durée</th>
+                  <th>Justifiée</th>
+                  <th>Note</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${absences.length ? absences.map(a => {
+                  const nom = a.emp_nom || "";
+                  const pts = nom.split(" ");
+                  return `
+                    <tr>
+                      <td>
+                        <div class="nc">
+                          <div class="av" style="${avS(a.emp_id)}">${ini(pts[0] || "", pts[1] || "")}</div>
+                          <span class="nm">${esc(nom)}</span>
+                        </div>
+                      </td>
+                      <td style="color:var(--ink2);">${fD(a.date)}</td>
+                      <td><span class="bdg ${a.type === "Absence" ? "babs" : "bret"}">${esc(a.type)}</span></td>
+                      <td style="font-size:12px;color:var(--ink3);">
+                        ${a.type === "Retard" ? (a.duree || 0) + " min" : "-"}
+                      </td>
+                      <td><span class="bdg ${a.justifiee ? "bjst" : "bnjst"}">${a.justifiee ? "Justifiée" : "Non justifiée"}</span></td>
+                      <td style="color:var(--ink3);font-size:12px;">${esc(a.note || "")}</td>
+                    </tr>
+                  `;
+                }).join("") : `
+                  <tr>
+                    <td colspan="6">
+                      <div class="empty">
+                        <div class="ei">📭</div>
+                        <div class="et">Aucune absence</div>
+                      </div>
+                    </td>
+                  </tr>
+                `}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ───────────────────────── Users ─────────────────────────── */
+
+function buildUsers(pages, acts) {
+  acts.innerHTML = `<button class="btn bg" onclick="openModal('newUser')">Compte</button>`;
+  const rT = { directeur:"role-tag-d", rh:"role-tag-r", employe:"role-tag-e" };
+  const rL = { directeur:"Directeur", rh:"RH", employe:"Employé" };
+  pages.innerHTML = `
+    <div class="page">
+      <div class="info-box">
+        <span>Pour réinitialiser le mot de passe d'un employé, cliquez sur "Éditer" et saisissez un nouveau mot de passe.</span>
+      </div>
+      <div class="card">
+        <div class="ch">
+          <div class="ch-l">
+            <div class="ch-ic" style="background:#ede9fe"></div>
+            <div>
+              <div class="ch-title">Comptes utilisateurs</div>
+              <div class="ch-sub">${users.length} comptes actifs</div>
+            </div>
+          </div>
+        </div>
+        <div class="mb">
+          <div class="tw">
+            <table>
+              <thead>
+                <tr>
+                  <th>Login</th>
+                  <th>Rôle</th>
+                  <th>Associé</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                ${users.map(u => `
+                  <tr>
+                    <td style="font-weight:600;font-family:'JetBrains Mono',monospace;font-size:13px;">${esc(u.login)}</td>
+                    <td>
+                      <span class="${rT[u.role] || "role-tag-e"}">${rL[u.role] || u.role}</span>
+                      ${u.must_change_pw ? `<span class="bsmp" style="margin-left:6px;">À changer</span>` : ""}
+                    </td>
+                    <td style="color:var(--ink3);font-size:13px;">${esc(u.emp_nom || "")}</td>
+                    <td style="text-align:right;white-space:nowrap;">
+                      <button class="btn bgh bsm" onclick="openModal('editUser', ${u.id})">Éditer</button>
+                      <button class="btn brj bsm" onclick="delUser(${u.id})" style="margin-left:4px;">Suppr.</button>
+                    </td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ───────────────────────── Mon espace ────────────────────── */
+
+function buildMonEspace(pages, acts) {
+  acts.innerHTML = `<button class="btn bgh" onclick="openModal('changePass')">Mot de passe</button>`;
+  const e = ME.employee;
+  if (!e) {
+    pages.innerHTML = `<div class="page"><p style="color:var(--ink3)">Fiche introuvable.</p></div>`;
+    return;
+  }
+  const senior = seniorityLabel(e.debut);
+  const solde = e.solde_cp || 0;
+  const maxSolde = 25;
+  const pct = Math.min(100, Math.round(solde / maxSolde * 100));
+  const soldeColor = solde <= 3 ? "#ef4444" : (solde <= 8 ? "#f59e0b" : "#22c55e");
+
+  const refusNotif = conges.filter(c => c.statut === "Refus" && c.note_refus);
+
+  pages.innerHTML = `
+    <div class="page">
+      ${refusNotif.length ? refusNotif.map(c => `
+        <div class="note-refus-box" style="margin-bottom:14px;font-size:13px;">
+          <span>⚠️</span>
+          <div>
+            <strong>Demande refusée</strong> : ${esc(c.type)} ${fD(c.debut)} → ${fD(c.fin)}<br>
+            <span style="color:var(--ink2)">Motif : ${esc(c.note_refus)}</span>
+          </div>
+        </div>
+      `).join("") : ""}
+
+      <div class="welcome">
+        <div class="welcome-name">Bonjour, ${esc(e.prenom)}</div>
+        <div class="welcome-sub">
+          ${esc(e.poste || "")}
+          ${e.contrat ? " · " + esc(e.contrat) : ""}
+          ${senior ? " · " + esc(senior) : ""}
+          ${e.date_fin ? " · Fin " + fD(e.date_fin) : ""}
+        </div>
+        <div class="solde-bar-wrap">
+          <div class="solde-label">
+            <span>Solde congés payés</span>
+            <span style="font-weight:700;color:${soldeColor};">${solde} jours restants</span>
+          </div>
+          <div class="solde-bar">
+            <div class="solde-fill" style="width:${pct}%;background:${solde <= 3 ? "#fca5a5" : (solde <= 8 ? "#fde68a" : "#bbf7d0")};"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="ch">
+          <div class="ch-l">
+            <div class="ch-ic" style="background:#e8f8f3"></div>
+            <div>
+              <div class="ch-title">Mes informations</div>
+              <div class="ch-sub">Vous pouvez modifier votre email et téléphone</div>
+            </div>
+          </div>
+          <button class="btn bg bsm" onclick="openModal('editSelf', ${e.id})">Modifier</button>
+        </div>
+        <div class="mb">
+          <div class="pfs">
+            <div class="pf">
+              <div class="pfl">Prénom</div>
+              <div class="pfv">${esc(e.prenom)}</div>
+            </div>
+            <div class="pf">
+              <div class="pfl">Nom</div>
+              <div class="pfv">${esc(e.nom)}</div>
+            </div>
+            <div class="pf">
+              <div class="pfl">Poste</div>
+              <div class="pfv">${esc(e.poste || "")}</div>
+            </div>
+            <div class="pf">
+              <div class="pfl">Contrat</div>
+              <div class="pfv">
+                <span class="bdg BC ${BC[e.contrat] || "bcd"}">${esc(e.contrat || "")}</span>
+              </div>
+            </div>
+            <div class="pf">
+              <div class="pfl">Date d'entrée</div>
+              <div class="pfv">${e.debut ? fD(e.debut) : "-"}</div>
+            </div>
+            ${senior ? `
+            <div class="pf">
+              <div class="pfl">Ancienneté</div>
+              <div class="pfv">${esc(senior)}</div>
+            </div>` : ""}
+            ${e.date_fin ? `
+            <div class="pf">
+              <div class="pfl">Fin de contrat</div>
+              <div class="pfv" style="color:var(--am)">${fD(e.date_fin)}</div>
+            </div>` : ""}
+            <div class="pf">
+              <div class="pfl">Email</div>
+              <div class="pfv">${esc(e.email || "")}</div>
+            </div>
+            <div class="pf">
+              <div class="pfl">Téléphone</div>
+              <div class="pfv">${esc(e.tel || "")}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ───────────────────────── Mes congés ────────────────────── */
+
+function buildMesConges(pages, acts) {
+  acts.innerHTML = `<button class="btn bbl" onclick="openModal('newConge')">Demande de congé</button>`;
+  const att = conges.filter(c => c.statut === "En attente").length;
+  const crn = { journee:"Journée", matin:"Matin", apm:"Après-midi" };
+  const me = ME.employee;
+  const myMonthly = me ? myCongesByMonth(me.id) : [];
+  const maxVal = myMonthly.length ? Math.max(...myMonthly.map(m => m.total), 1) : 1;
+  const myTypes = me ? myCongesByType(me.id) : [];
+  const maxTypeVal = myTypes.length ? Math.max(...myTypes.map(t => t.total), 1) : 1;
+
+  const statsAndChartHtml = `
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px;">
+      <div class="sc" style="--scb:#e8f8f3;">
+        <div class="sc-lbl">Total demandes</div>
+        <div class="sc-val">${conges.length}</div>
+      </div>
+      <div class="sc" style="--scb:#fffbeb;--scv:${att ? "var(--am)" : "var(--ink)"};">
+        <div class="sc-lbl">En attente</div>
+        <div class="sc-val">${att}</div>
+      </div>
+      <div class="sc" style="--scb:#e8f8f3;">
+        <div class="sc-lbl">Approuvés</div>
+        <div class="sc-val">${conges.filter(c => c.statut === "Approuvé").length}</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div class="ch">
+        <div class="ch-l">
+          <div class="ch-ic" style="background:#fffbeb"></div>
+          <div>
+            <div class="ch-title">Mes congés</div>
+            <div class="ch-sub">
+              ${myMonthly.length || myTypes.length ? "Vue par mois et par type" : "Pas encore de données"}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="mb">
+        ${myMonthly.length ? `
+        <div style="padding:14px 16px;border-bottom:1px solid var(--s3);">
+          <div style="font-size:11px;font-weight:600;color:var(--ink4);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px;">
+            Congés par mois (soumis)
+          </div>
+          <div class="chart-wrap">
+            ${myMonthly.map(m => {
+              const hTotal = Math.round(m.total / maxVal * 60);
+              const hApp = Math.round(m.approuves / maxVal * 60);
+              const lbl = m.mois.slice(5);
+              return `
+                <div class="bar-group">
+                  <div class="bar-inner">
+                    <div class="bar" style="height:${hTotal}px;background:#bfdbfe;width:16px;" title="Total: ${m.total}"></div>
+                    <div class="bar" style="height:${hApp}px;background:var(--g);width:16px;" title="Approuvés: ${m.approuves}"></div>
+                  </div>
+                  <div class="bar-lbl">${lbl}</div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+          <div style="display:flex;gap:16px;font-size:11px;color:var(--ink3);margin-top:8px;padding:0 4px;">
+            <span style="display:flex;align-items:center;gap:5px;">
+              <span style="width:10px;height:10px;background:#bfdbfe;border-radius:2px;display:inline-block;"></span>
+              Total
+            </span>
+            <span style="display:flex;align-items:center;gap:5px;">
+              <span style="width:10px;height:10px;background:var(--g);border-radius:2px;display:inline-block;"></span>
+              Approuvés
+            </span>
+          </div>
+        </div>
+        ` : `
+        <div style="padding:14px 16px;border-bottom:1px solid var(--s3);">
+          <div class="empty">
+            <div class="ei">📊</div>
+            <div class="et">Pas encore de données par mois</div>
+          </div>
+        </div>
+        `}
+
+        <div style="padding:14px 16px;">
+          <div style="font-size:11px;font-weight:600;color:var(--ink4);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px;">
+            Congés par type
+          </div>
+          ${myTypes.length ? `
+          <div class="chart-wrap" style="height:auto;align-items:flex-end;">
+            ${myTypes.map(t => {
+              const hTotal = Math.round(t.total / maxTypeVal * 60);
+              const hApp = Math.round(t.approuves / maxTypeVal * 60);
+              const lbl = t.type.length > 9 ? t.type.slice(0,8) + "…" : t.type;
+              return `
+                <div class="bar-group">
+                  <div class="bar-inner">
+                    <div class="bar" style="height:${hTotal}px;background:#fde68a;width:16px;" title="${t.type}: ${t.total}"></div>
+                    <div class="bar" style="height:${hApp}px;background:#22c55e;width:16px;" title="${t.type} approuvés: ${t.approuves}"></div>
+                  </div>
+                  <div class="bar-lbl" title="${t.type}">${lbl}</div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+          <div style="display:flex;gap:16px;font-size:11px;color:var(--ink3);margin-top:8px;padding:0 4px;">
+            <span style="display:flex;align-items:center;gap:5px;">
+              <span style="width:10px;height:10px;background:#fde68a;border-radius:2px;display:inline-block;"></span>
+              Total
+            </span>
+            <span style="display:flex;align-items:center;gap:5px;">
+              <span style="width:10px;height:10px;background:#22c55e;border-radius:2px;display:inline-block;"></span>
+              Approuvés
+            </span>
+          </div>
+          ` : `
+          <div class="empty">
+            <div class="ei">📊</div>
+            <div class="et">Pas encore de données par type</div>
+          </div>
+          `}
+        </div>
+      </div>
+    </div>
+  `;
+
+  const tableHtml = `
+    <div class="card">
+      <div class="ch">
+        <div class="ch-l">
+          <div class="ch-ic" style="background:#fffbeb"></div>
+          <div>
+            <div class="ch-title">Mes demandes de congé</div>
+            <div class="ch-sub">${conges.length} demande${conges.length > 1 ? "s" : ""}</div>
+          </div>
+        </div>
+      </div>
+      <div class="mb">
+        <div class="tw">
+          <table>
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Du</th>
+                <th>Au</th>
+                <th>Créneau</th>
+                <th>Motif</th>
+                <th>Statut</th>
+                <th>Soumis le</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${conges.length ? conges.map(c => `
+              <tr>
+                <td><span class="bdg BT ${BT[c.type] || "btyp"}">${esc(c.type || "")}</span></td>
+                <td style="color:var(--ink2);">${fD(c.debut)}</td>
+                <td style="color:var(--ink2);">${fD(c.fin)}</td>
+                <td style="font-size:12px;color:var(--ink3);">${crn[c.creneau] || "Journée"}</td>
+                <td style="color:var(--ink3);font-size:12px;">${esc(c.motif || "")}</td>
+                <td>
+                  <span class="bdg BS ${BS[c.statut] || "batt"}">${esc(c.statut)}</span>
+                  ${c.statut === "Refus" && c.note_refus ? `
+                    <div class="note-refus-box" style="margin-top:6px;padding:7px 10px;">${esc(c.note_refus)}</div>
+                  ` : ""}
+                </td>
+                <td style="color:var(--ink4);font-size:12px;">${c.created_at ? c.created_at.slice(0,10) : ""}</td>
+              </tr>
+              `).join("") : `
+              <tr>
+                <td colspan="7">
+                  <div class="empty">
+                    <div class="ei">🗓️</div>
+                    <div class="et">Aucune demande</div>
+                  </div>
+                </td>
+              </tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+
+  pages.innerHTML = `
+    <div class="page">
+      ${statsAndChartHtml}
+      ${tableHtml}
+    </div>
+  `;
+}
+
+/* ───────────────────────── Mes absences ──────────────────── */
+
+function buildMesAbsences(pages, acts) {
+  pages.innerHTML = `
+    <div class="page">
+      <div class="info-box">
+        <span>Les absences sont enregistrées par la RH. Contactez votre responsable pour toute question.</span>
+      </div>
+      <div class="card">
+        <div class="ch">
+          <div class="ch-l">
+            <div class="ch-ic" style="background:#f5f3ff"></div>
+            <div>
+              <div class="ch-title">Mes absences</div>
+              <div class="ch-sub">${absences.length} enregistrement${absences.length > 1 ? "s" : ""}</div>
+            </div>
+          </div>
+        </div>
+        <div class="mb">
+          <div class="tw">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Type</th>
+                  <th>Durée</th>
+                  <th>Justifiée</th>
+                  <th>Note</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${absences.length ? absences.map(a => `
+                  <tr>
+                    <td style="color:var(--ink2);">${fD(a.date)}</td>
+                    <td><span class="bdg ${a.type === "Absence" ? "babs" : "bret"}">${esc(a.type)}</span></td>
+                    <td style="font-size:12px;color:var(--ink3);">
+                      ${a.type === "Retard" ? (a.duree || 0) + " min" : "-"}
+                    </td>
+                    <td><span class="bdg ${a.justifiee ? "bjst" : "bnjst"}">${a.justifiee ? "Justifiée" : "Non justifiée"}</span></td>
+                    <td style="color:var(--ink3);font-size:12px;">${esc(a.note || "")}</td>
+                  </tr>
+                `).join("") : `
+                <tr>
+                  <td colspan="5">
+                    <div class="empty">
+                      <div class="ei">📭</div>
+                      <div class="et">Aucune absence</div>
+                    </div>
+                  </td>
+                </tr>`}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ───────────────────────── Actions / Modales ───────────────── */
+
+async function approuverCg(id, statut, noteRefus="") {
+  const c = await api(`/api/conges/${id}`, "PUT", { statut, note_refus: noteRefus });
+  if (!c) return;
+  const i = conges.findIndex(x => x.id === id);
+  if (i >= 0) conges[i] = c;
+  await loadData();
+  showTab("conges");
+  toast(statut === "Approuvé" ? "Demande approuvée" : "Demande refusée");
+}
+
+function openRefusModal(id) {
+  const c = conges.find(x => x.id === id);
+  document.getElementById("mc").innerHTML = `
+    <div class="mbg" onclick="bgce(event)">
+      <div class="modal">
+        <div class="mh">
+          <div class="mt">Refuser la demande</div>
+          <button class="mx" onclick="closeModal()">✕</button>
+        </div>
+        <div class="mdiv"></div>
+        <div class="mb">
+          <div style="background:var(--rdlt);border-radius:10px;padding:11px 13px;margin-bottom:16px;font-size:13px;color:var(--rd);">
+            <strong>${c ? esc(c.emp_nom) : ""}</strong><br>
+            ${c ? esc(c.type || "") + " " + fD(c.debut) + " → " + fD(c.fin) : ""}
+          </div>
+          <div class="fg">
+            <label class="fl">Raison du refus (optionnel)</label>
+            <textarea class="fc" id="note-refus" rows="3" placeholder="Ex : Planning chargé sur cette période, merci de proposer d'autres dates..."></textarea>
+          </div>
+        </div>
+        <div class="mf">
+          <button class="btn bgh" onclick="closeModal()">Annuler</button>
+          <button class="btn brj" onclick="confirmRefus(${id})">Confirmer le refus</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+async function confirmRefus(id) {
+  const note = document.getElementById("note-refus").value.trim();
+  closeModal();
+  await approuverCg(id, "Refus", note);
+}
+
+async function delUser(id) {
+  if (!confirm("Supprimer ce compte ?")) return;
+  const r = await api(`/api/users/${id}`, "DELETE");
+  if (!r) return;
+  users = users.filter(u => u.id !== id);
+  showTab("users");
+  toast("Compte supprimé");
+}
+
+async function doLogout() {
+  await api("/api/logout", "POST");
+  window.location.href = "/login";
+}
+
+function exportExcel() {
+  window.location.href = "/api/export";
+  toast("Export en cours");
+}
+
+function toggleRetardDuree() {
+  const typeEl = document.getElementById("at");
+  const fg = document.getElementById("fg-duree");
+  if (!typeEl || !fg) return;
+  fg.style.display = typeEl.value === "Retard" ? "block" : "none";
+}
+
+/* ───────────────────────── Modales génériques ───────────────── */
+
+function openModal(type, id) {
+  const e = id ? employees.find(x => x.id === id) : null;
+  const u = id ? users.find(x => x.id === id) : null;
+  const empOpts = employees.map(x => `<option value="${x.id}">${esc(x.prenom)} ${esc(x.nom)}</option>`).join("");
+
+  let hh = "", bh = "", fh = "";
+  const TYPES = ["Congés pays","RTT","Maladie","Congé maternité","Congé paternité","Demi-journée","Congé exceptionnel","Autre"];
+  const CONTRATS = ["CDI","CDD","Alternant","Autoentrepreneur","Stagiaire","Contrat pro"];
+
+  if (type === "viewEmp") {
+    const ec = conges.filter(c => c.empid === e.id);
+    const ea = absences.filter(a => a.empid === e.id);
+    const senior = seniorityLabel(e.debut);
+    const solde = e.solde_cp || 0;
+    const pct = Math.min(100, Math.round(solde / 25 * 100));
+    hh = `
+      <div class="ph">
+        <div class="avlg" style="${avS(e.id)}">${ini(e.prenom, e.nom)}</div>
+        <div style="flex:1">
+          <div class="pn">${esc(e.prenom)} ${esc(e.nom)}</div>
+          <div class="pp">${esc(e.poste || "")}</div>
+          <span class="bdg BC ${BC[e.contrat] || "bcd"}">${esc(e.contrat || "")}</span>
+        </div>
+      </div>
+    `;
+    bh = `
+      <div class="pfs">
+        <div class="pf">
+          <div class="pfl">Email</div>
+          <div class="pfv">${esc(e.email || "")}</div>
+        </div>
+        <div class="pf">
+          <div class="pfl">Téléphone</div>
+          <div class="pfv">${esc(e.tel || "")}</div>
+        </div>
+        <div class="pf">
+          <div class="pfl">Date d'entrée</div>
+          <div class="pfv">${fD(e.debut)}</div>
+        </div>
+        ${senior ? `
+        <div class="pf">
+          <div class="pfl">Ancienneté</div>
+          <div class="pfv">${esc(senior)}</div>
+        </div>` : ""}
+        <div class="pf">
+          <div class="pfl">Fin contrat</div>
+          <div class="pfv" style="color:${e.date_fin ? "var(--am)" : "var(--ink4)"}">
+            ${e.date_fin ? fD(e.date_fin) : "-"}
+          </div>
+        </div>
+        <div class="pf" style="grid-column:span 2;">
+          <div class="pfl">Solde congés payés</div>
+          <div style="display:flex;align-items:center;gap:10px;margin-top:4px;">
+            <div style="flex:1;height:8px;background:var(--s3);border-radius:4px;overflow:hidden;">
+              <div style="height:100%;width:${pct}%;background:${solde <= 3 ? "#ef4444" : (solde <= 8 ? "#f59e0b" : "#22c55e")};border-radius:4px;"></div>
+            </div>
+            <span style="font-weight:700;font-size:14px;color:${solde <= 3 ? "#ef4444" : (solde <= 8 ? "#f59e0b" : "#22c55e")}">
+              ${solde} j
+            </span>
+          </div>
+        </div>
+      </div>
+      <div class="ssep">Congés (${ec.length})</div>
+      ${ec.length ? ec.map(c => `
+        <div class="cr">
+          <div>
+            <div class="ci">${esc(c.type || "")}</div>
+            <div class="cd">
+              ${fD(c.debut)} → ${fD(c.fin)}
+              ${c.creneau && c.creneau !== "journee" ? " · " + (c.creneau === "matin" ? "Matin" : "Après-midi") : ""}
+            </div>
+            ${c.motif ? `<div class="cd" style="margin-top:2px;color:var(--ink3)">${esc(c.motif)}</div>` : ""}
+          </div>
+          <div>
+            <span class="bdg BS ${BS[c.statut] || "batt"}">${esc(c.statut)}</span>
+            ${c.note_refus ? `<div class="note-refus-box" style="margin-top:5px;">${esc(c.note_refus)}</div>` : ""}
+          </div>
+        </div>
+      `).join("") : `<div style="font-size:12px;color:var(--ink4)">Aucun congé enregistré</div>`}
+      <div class="ssep">Absences (${ea.length})</div>
+      ${ea.length ? ea.map(a => `
+        <div class="cr">
+          <div>
+            <div class="ci">${esc(a.type)}</div>
+            <div class="cd">${fD(a.date)}</div>
+            ${a.note ? `<div class="cd" style="margin-top:2px;color:var(--ink3)">${esc(a.note)}</div>` : ""}
+          </div>
+          <div>
+            <span class="bdg ${a.justifiee ? "bjst" : "bnjst"}">${a.justifiee ? "Justifiée" : "Non justifiée"}</span>
+            ${a.type === "Retard" ? `<div class="cd" style="margin-top:4px;color:var(--ink3);font-size:11px;">${a.duree || 0} min de retard</div>` : ""}
+          </div>
+        </div>
+      `).join("") : `<div style="font-size:12px;color:var(--ink4)">Aucune absence enregistrée</div>`}
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Fermer</button>
+      <button class="btn bg" onclick="closeModal();openModal('editEmp', ${e.id})">Éditer</button>
+    `;
+  } else if (type === "newEmp" || type === "editEmp") {
+    const isEdit = type === "editEmp";
+    hh = `<div class="mt">${isEdit ? "Modifier la fiche" : "Nouveau collaborateur"}</div>`;
+    bh = `
+      <div class="fr">
+        <div class="fg">
+          <label class="fl">Prénom</label>
+          <input class="fc" id="fp" value="${e ? esc(e.prenom) : ""}">
+        </div>
+        <div class="fg">
+          <label class="fl">Nom</label>
+          <input class="fc" id="fn" value="${e ? esc(e.nom) : ""}">
+        </div>
+      </div>
+      <div class="fr">
+        <div class="fg">
+          <label class="fl">Poste</label>
+          <input class="fc" id="fpo" value="${e ? esc(e.poste || "") : ""}">
+        </div>
+        <div class="fg">
+          <label class="fl">Contrat</label>
+          <select class="fc" id="fct">
+            ${CONTRATS.map(c => `<option${e && e.contrat === c ? " selected" : ""}>${c}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div class="fr">
+        <div class="fg">
+          <label class="fl">Email</label>
+          <input class="fc" id="fem" type="email" value="${e ? esc(e.email || "") : ""}">
+        </div>
+        <div class="fg">
+          <label class="fl">Téléphone</label>
+          <input class="fc" id="fte" value="${e ? esc(e.tel || "") : ""}">
+        </div>
+      </div>
+      <div class="fr">
+        <div class="fg">
+          <label class="fl">Date d'entrée</label>
+          <input class="fc" id="fdb" type="date" value="${e ? (e.debut || TODAY) : TODAY}">
+        </div>
+        <div class="fg">
+          <label class="fl">Fin de contrat</label>
+          <input class="fc" id="fdf" type="date" value="${e && e.date_fin ? e.date_fin : ""}">
+        </div>
+      </div>
+      <div class="fg">
+        <label class="fl">Solde congés payés (jours)</label>
+        <input class="fc" id="fcp" type="number" min="0" max="50" value="${e ? (e.solde_cp || 25) : 25}">
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bg" onclick="${isEdit ? `saveEmp(${e.id})` : "addEmp()"}">${isEdit ? "Enregistrer" : "Ajouter"}</button>
+    `;
+  } else if (type === "editSelf") {
+    hh = `<div class="mt">Modifier mes coordonnées</div>`;
+    bh = `
+      <div class="info-box">
+        <span>Vous pouvez modifier uniquement votre email et téléphone.</span>
+      </div>
+      <div class="fg">
+        <label class="fl">Email</label>
+        <input class="fc" id="fem" type="email" value="${e ? esc(e.email || "") : ""}">
+      </div>
+      <div class="fg">
+        <label class="fl">Téléphone</label>
+        <input class="fc" id="fte" value="${e ? esc(e.tel || "") : ""}">
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bg" onclick="saveSelf(${e.id})">Enregistrer</button>
+    `;
+  } else if (type === "newConge") {
+    const isSelf = ME.current_user.role === "employe";
+    hh = `<div class="mt">Nouvelle demande de congé</div>`;
+    bh = `
+      ${!isSelf ? `
+      <div class="fg">
+        <label class="fl">Collaborateur</label>
+        <select class="fc" id="ce">${empOpts}</select>
+      </div>` : ""}
+      <div class="fg">
+        <label class="fl">Type</label>
+        <select class="fc" id="ct">${TYPES.map(t => `<option>${t}</option>`).join("")}</select>
+      </div>
+      <div class="fr">
+        <div class="fg">
+          <label class="fl">Du</label>
+          <input class="fc" id="cd" type="date" value="${TODAY}">
+        </div>
+        <div class="fg">
+          <label class="fl">Au</label>
+          <input class="fc" id="cf" type="date" value="${TODAY}">
+        </div>
+      </div>
+      <div class="fg">
+        <label class="fl">Créneau</label>
+        <select class="fc" id="cren">
+          <option value="journee">Journée entière</option>
+          <option value="matin">Matin (demi-journée)</option>
+          <option value="apm">Après-midi (demi-journée)</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label class="fl">Motif</label>
+        <textarea class="fc" id="cm" rows="2" placeholder="Précisions optionnelles..."></textarea>
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bbl" onclick="addCg()">Soumettre</button>
+    `;
+  } else if (type === "newAbs") {
+    hh = `<div class="mt">Enregistrer une absence</div>`;
+    bh = `
+      <div class="fg">
+        <label class="fl">Collaborateur</label>
+        <select class="fc" id="ae">${empOpts}</select>
+      </div>
+      <div class="fr">
+        <div class="fg">
+          <label class="fl">Date</label>
+          <input class="fc" id="ad" type="date" value="${TODAY}">
+        </div>
+        <div class="fg">
+          <label class="fl">Type</label>
+          <select class="fc" id="at" onchange="toggleRetardDuree()">
+            <option>Absence</option>
+            <option>Retard</option>
+          </select>
+        </div>
+      </div>
+      <div class="fg" id="fg-duree" style="display:none;">
+        <label class="fl">Durée du retard (minutes)</label>
+        <input class="fc" id="adur" type="number" min="0" step="5" placeholder="Ex : 15">
+      </div>
+      <div class="fg">
+        <label class="fl">Justifiée ?</label>
+        <select class="fc" id="aj">
+          <option value="1">Oui (justifiée)</option>
+          <option value="0">Non (non justifiée)</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label class="fl">Note</label>
+        <input class="fc" id="an" placeholder="Transport, RDV médical...">
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bpu" onclick="addAbs()">Enregistrer</button>
+    `;
+  } else if (type === "newUser" || type === "editUser") {
+    const isEdit = type === "editUser";
+    hh = `<div class="mt">${isEdit ? "Modifier le compte" : "Nouveau compte"}</div>`;
+    bh = `
+      <div class="fg">
+        <label class="fl">Login</label>
+        <input class="fc" id="ul" value="${u ? esc(u.login) : ""}" ${isEdit ? "readonly" : ""}>
+      </div>
+      <div class="fg">
+        <label class="fl">${isEdit ? "Nouveau mot de passe (vide = inchangé)" : "Mot de passe"}</label>
+        <input class="fc" id="up" type="password" placeholder="${isEdit ? "" : ""}">
+      </div>
+      <div class="fg">
+        <label class="fl">Rôle</label>
+        <select class="fc" id="ur">
+          ${["directeur","rh","employe"].map(r => `
+            <option value="${r}"${u && u.role === r ? " selected" : ""}>
+              ${r === "directeur" ? "Directeur" : r === "rh" ? "RH" : "Employé"}
+            </option>
+          `).join("")}
+        </select>
+      </div>
+      <div class="fg">
+        <label class="fl">Associer</label>
+        <select class="fc" id="uep">
+          <option value="">Aucun</option>
+          ${empOpts}
+        </select>
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bg" onclick="${isEdit ? `saveUser(${u.id})` : "addUser()"}">${isEdit ? "Enregistrer" : "Créer"}</button>
+    `;
+  } else if (type === "changePass") {
+    hh = `<div class="mt">Changer mon mot de passe</div>`;
+    bh = `
+      <div class="fg">
+        <label class="fl">Ancien mot de passe</label>
+        <input class="fc" id="op" type="password">
+      </div>
+      <div class="fg">
+        <label class="fl">Nouveau mot de passe</label>
+        <input class="fc" id="np" type="password">
+      </div>
+      <div class="fg">
+        <label class="fl">Confirmer</label>
+        <input class="fc" id="np2" type="password">
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bg" onclick="changePass()">Changer</button>
+    `;
+  } else if (type === "importEmp") {
+    hh = `<div class="mt">Importer des collaborateurs (Excel)</div>`;
+    bh = `
+      <div class="info-box">
+        <span>
+          Sélectionnez un fichier Excel exporté (ou au même format).
+          Les lignes seront ajoutées ou mises à jour à partir de l'email.
+        </span>
+      </div>
+      <div class="fg">
+        <label class="fl">Fichier Excel (.xlsx)</label>
+        <input class="fc" id="imp-file" type="file" accept=".xlsx">
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bg" onclick="doImportEmp()">Importer</button>
+    `;
+  } else if (type === "importCA") {
+    hh = `<div class="mt">Importer congés et absences</div>`;
+    bh = `
+      <div class="info-box">
+        <span>
+          Utilisez un fichier Excel avec deux onglets : <strong>Congés</strong> et <strong>Absences</strong>,
+          au même format que l'export. Les données seront ajoutées.
+        </span>
+      </div>
+      <div class="fg">
+        <label class="fl">Fichier Excel (.xlsx)</label>
+        <input class="fc" id="imp-ca-file" type="file" accept=".xlsx">
+      </div>
+    `;
+    fh = `
+      <button class="btn bgh" onclick="closeModal()">Annuler</button>
+      <button class="btn bg" onclick="doImportCA()">Importer</button>
+    `;
+  }
+
+  document.getElementById("mc").innerHTML = `
+    <div class="mbg" onclick="bgce(event)">
+      <div class="modal">
+        <div class="mh">
+          ${hh}
+          <button class="mx" onclick="closeModal()">✕</button>
+        </div>
+        <div class="mdiv"></div>
+        <div class="mb">${bh}</div>
+        <div class="mf">${fh}</div>
+      </div>
+    </div>
+  `;
+}
+
+function bgce(e) {
+  if (e.target.classList.contains("mbg")) closeModal();
+}
+function closeModal() {
+  document.getElementById("mc").innerHTML = "";
+}
+
+/* ───────────────────────── CRUD helpers ───────────────────── */
+
+async function addEmp() {
+  const p = document.getElementById("fp").value.trim();
+  const n = document.getElementById("fn").value.trim();
+  if (!p || !n) {
+    alert("Prénom et nom requis");
+    return;
+  }
+  const emp = await api("/api/employees", "POST", {
+    prenom: p,
+    nom: n,
+    poste: document.getElementById("fpo").value.trim(),
+    contrat: document.getElementById("fct").value,
+    email: document.getElementById("fem").value.trim(),
+    tel: document.getElementById("fte").value.trim(),
+    debut: document.getElementById("fdb").value,
+    date_fin: document.getElementById("fdf").value || null,
+    solde_cp: parseInt(document.getElementById("fcp").value || "25", 10)
+  });
+  if (!emp) return;
+  employees.push(emp);
+  closeModal();
+  showTab("annuaire");
+  toast(`${p} ${n} ajouté`);
+}
+
+async function saveEmp(id) {
+  const emp = await api(`/api/employees/${id}`, "PUT", {
+    prenom: document.getElementById("fp").value.trim(),
+    nom: document.getElementById("fn").value.trim(),
+    poste: document.getElementById("fpo").value.trim(),
+    contrat: document.getElementById("fct").value,
+    email: document.getElementById("fem").value.trim(),
+    tel: document.getElementById("fte").value.trim(),
+    debut: document.getElementById("fdb").value,
+    date_fin: document.getElementById("fdf").value || null,
+    solde_cp: parseInt(document.getElementById("fcp").value || "0", 10)
+  });
+  if (!emp) return;
+  const i = employees.findIndex(e => e.id === id);
+  if (i >= 0) employees[i] = emp;
+  closeModal();
+  showTab("annuaire");
+  toast("Fiche mise à jour");
+}
+
+async function saveSelf(id) {
+  const emp = await api(`/api/employees/${id}`, "PUT", {
+    email: document.getElementById("fem").value.trim(),
+    tel: document.getElementById("fte").value.trim()
+  });
+  if (!emp) return;
+  ME.employee = emp;
+  closeModal();
+  showTab("monespace");
+  toast("Coordonnées mises à jour");
+}
+
+async function addCg() {
+  const debut = document.getElementById("cd").value;
+  const fin = document.getElementById("cf").value;
+  if (!debut || !fin) {
+    alert("Dates requises");
+    return;
+  }
+  const body = {
+    type: document.getElementById("ct").value,
+    debut,
+    fin,
+    creneau: document.getElementById("cren").value,
+    motif: document.getElementById("cm").value.trim()
+  };
+  const ceEl = document.getElementById("ce");
+  if (ceEl) body.emp_id = parseInt(ceEl.value, 10);
+  const c = await api("/api/conges", "POST", body);
+  if (!c) return;
+  conges.unshift(c);
+  updateBadge();
+  closeModal();
+  showTab(ME.current_user.role === "employe" ? "mesconges" : "conges");
+  toast("Demande soumise");
+}
+
+async function addAbs() {
+  const type = document.getElementById("at").value;
+  let duree = 0;
+  if (type === "Retard") {
+    const v = document.getElementById("adur").value;
+    duree = parseInt(v || "0", 10);
+    if (isNaN(duree) || duree < 0) duree = 0;
+  }
+  const a = await api("/api/absences", "POST", {
+    emp_id: parseInt(document.getElementById("ae").value, 10),
+    date: document.getElementById("ad").value,
+    type: type,
+    justifiee: document.getElementById("aj").value === "1",
+    note: document.getElementById("an").value.trim(),
+    duree: duree
+  });
+  if (!a) return;
+  absences.unshift(a);
+  closeModal();
+  showTab("absences");
+  toast("Absence enregistrée");
+}
+
+async function addUser() {
+  const login = document.getElementById("ul").value.trim();
+  const pw = document.getElementById("up").value;
+  if (!login || !pw) {
+    alert("Login et mot de passe requis");
+    return;
+  }
+  const uep = document.getElementById("uep").value;
+  const r = await api("/api/users", "POST", {
+    login,
+    password: pw,
+    role: document.getElementById("ur").value,
+    emp_id: uep || null
+  });
+  if (!r) return;
+  users = await api("/api/users") || [];
+  closeModal();
+  showTab("users");
+  toast("Compte créé");
+}
+
+async function saveUser(id) {
+  const pw = document.getElementById("up").value;
+  const uep = document.getElementById("uep").value;
+  const body = {
+    role: document.getElementById("ur").value,
+    emp_id: uep || null
+  };
+  if (pw) body.password = pw;
+  const r = await api(`/api/users/${id}`, "PUT", body);
+  if (!r) return;
+  users = await api("/api/users") || [];
+  closeModal();
+  showTab("users");
+  toast("Compte mis à jour");
+}
+
+async function changePass() {
+  const oldp = document.getElementById("op").value;
+  const np = document.getElementById("np").value;
+  const np2 = document.getElementById("np2").value;
+  if (!oldp || !np || !np2) {
+    alert("Tous les champs sont requis");
+    return;
+  }
+  if (np !== np2) {
+    alert("La confirmation ne correspond pas");
+    return;
+  }
+  const r = await api("/api/change-password", "POST", {
+    old_password: oldp,
+    new_password: np
+  });
+  if (!r) return;
+  closeModal();
+  toast("Mot de passe mis à jour");
+}
+
+/* ───────────────────────── Import helpers ────────────────── */
+
+async function doImportEmp() {
+  const input = document.getElementById("imp-file");
+  if (!input || !input.files || !input.files[0]) {
+    alert("Veuillez sélectionner un fichier Excel");
+    return;
+  }
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  try {
+    const r = await fetch("/api/import-employees", { method:"POST", body: fd });
+    const data = await r.json();
+    if (!r.ok) {
+      alert(data.error || "Erreur lors de l'import");
+      return;
+    }
+    employees = await api("/api/employees") || [];
+    closeModal();
+    showTab("annuaire");
+    toast(`Import terminé : ${data.imported} ajoutés, ${data.updated} mis à jour, ${data.skipped} ignorés`);
+  } catch {
+    alert("Erreur réseau lors de l'import");
+  }
+}
+
+async function doImportCA() {
+  const input = document.getElementById("imp-ca-file");
+  if (!input || !input.files || !input.files[0]) {
+    alert("Veuillez sélectionner un fichier Excel");
+    return;
+  }
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  try {
+    const r = await fetch("/api/import-conges-absences", { method:"POST", body: fd });
+    const data = await r.json();
+    if (!r.ok) {
+      alert(data.error || "Erreur lors de l'import");
+      return;
+    }
+    conges = await api("/api/conges") || [];
+    absences = await api("/api/absences") || [];
+    closeModal();
+    showTab("conges");
+    toast(`Import terminé - Congés: ${data.imported_conges} ajoutés, Absences: ${data.imported_absences} ajoutées`);
+  } catch {
+    alert("Erreur réseau lors de l'import");
+  }
+}
+
+window.addEventListener("load", init);
+</script>

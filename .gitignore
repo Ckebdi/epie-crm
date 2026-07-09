@@ -1,0 +1,49 @@
+# ── Base de données (ne JAMAIS committer les données réelles) ──
+*.db
+*.sqlite
+*.sqlite3
+epie_crm.db
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Environnements virtuels ────────────────────────────────────
+.env
+.env.local
+.env.production
+*.env
+
+# ── Fichiers temporaires et système ───────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# ── Fichiers uploadés / exports ────────────────────────────────
+uploads/
+exports/
+*.xlsx.bak
+
+# ── Logs ───────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Clés secrètes ─────────────────────────────────────────────
+secret_key.txt
+config_prod.py
