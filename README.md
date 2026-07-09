@@ -5,7 +5,6 @@ Application web de gestion RH développée pour **Epie Formation**, organisme de
 > Projet interne · Python + Flask + SQLite · Zéro dépendance cloud
 
 ---
-
 ## ✨ Fonctionnalités
 
 ### 3 niveaux d'accès
