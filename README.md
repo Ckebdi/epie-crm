@@ -1,3 +1,6 @@
+## Overview
+
+This project is an internal CRM prototype developed for EPIE as part of a data and process automation initiative. The application is built with Python and Flask, and focuses on centralizing client information, follow‑ups, and key indicators in a simple web interface. It is designed as a lightweight proof of concept that can be extended with additional features such as authentication, reporting, and integration with existing tools.
 ## Installation
 
 ### Prérequis
