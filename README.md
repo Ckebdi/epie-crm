@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # 🎓 Epie Formation — CRM Ressources Humaines
 
 Application web de gestion RH développée pour **Epie Formation**, organisme de formation professionnelle basé à Saint-Denis (93).
