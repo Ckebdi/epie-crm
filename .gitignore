@@ -35,9 +35,14 @@ Thumbs.db
 .vscode/
 *.iml
 
-# ── Fichiers uploadés / exports ────────────────────────────────
+# ── Fichiers uploadés / exports / sauvegardes ──────────────────
 uploads/
 exports/
+backups/
+backup_*/
+
+# ── Outils locaux ───────────────────────────────────────────────
+.claude/
 *.xlsx.bak
 
 # ── Logs ───────────────────────────────────────────────────────

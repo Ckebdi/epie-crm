@@ -1,10 +1,34 @@
 from flask import Flask, jsonify, request, render_template, send_file, session, redirect
-import sqlite3, os, io, hashlib, secrets
+import sqlite3, os, io, hashlib, secrets, time
 from datetime import datetime, date, timedelta
 from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+
+
+def _secret_key():
+    """Clé de session persistée localement (hors git) : les sessions survivent aux redémarrages."""
+    path = os.path.join(os.path.dirname(__file__), "secret_key.txt")
+    try:
+        k = open(path).read().strip()
+        if k:
+            return k
+    except Exception:
+        pass
+    k = secrets.token_hex(32)
+    try:
+        open(path, "w").write(k)
+    except Exception:
+        pass
+    return k
+
+
+app.secret_key = _secret_key()
+app.config["TEMPLATES_AUTO_RELOAD"] = True  # recharge les templates modifiés sans redémarrer
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)  # expiration de session
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 DB = os.path.join(os.path.dirname(__file__), "epie_crm.db")
 
@@ -16,7 +40,69 @@ def get_db():
 
 
 def hash_pw(pw):
+    """Ancien hachage (SHA-256 non salé) — conservé pour vérifier les comptes existants."""
     return hashlib.sha256(pw.encode()).hexdigest()
+
+
+def make_pw_hash(pw):
+    """Hachage renforcé : PBKDF2-SHA256 salé (fourni par Werkzeug, inclus dans Flask)."""
+    return generate_password_hash(pw)
+
+
+def verify_pw(stored, pw):
+    """Vérifie un mot de passe quel que soit le format du hash stocké (ancien ou nouveau)."""
+    if not stored:
+        return False
+    if stored.startswith(("pbkdf2:", "scrypt:")):
+        try:
+            return check_password_hash(stored, pw)
+        except Exception:
+            return False
+    return stored == hash_pw(pw)  # ancien format SHA-256
+
+
+# ── Limitation des tentatives de connexion ──────────────────────────────────
+LOGIN_MAX_ATTEMPTS = 5     # échecs avant blocage
+LOGIN_WINDOW = 15 * 60     # fenêtre de comptage / durée du blocage (15 min)
+_login_attempts = {}       # "ip|login" -> [nb_échecs, timestamp_premier_échec]
+
+
+def _login_check(key):
+    """Minutes de blocage restantes, ou 0 si la connexion est autorisée."""
+    rec = _login_attempts.get(key)
+    if not rec:
+        return 0
+    count, first = rec
+    if time.time() - first > LOGIN_WINDOW:
+        _login_attempts.pop(key, None)
+        return 0
+    if count >= LOGIN_MAX_ATTEMPTS:
+        return max(1, int((LOGIN_WINDOW - (time.time() - first)) // 60))
+    return 0
+
+
+def _login_fail(key):
+    rec = _login_attempts.get(key)
+    if rec and time.time() - rec[1] <= LOGIN_WINDOW:
+        rec[0] += 1
+    else:
+        _login_attempts[key] = [1, time.time()]
+    return _login_attempts[key][0]
+
+
+# ── Journal d'audit ─────────────────────────────────────────────────────────
+def audit(action, details="", login=None):
+    """Trace une action sensible. Ne bloque jamais l'application en cas d'erreur."""
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO audit_log (user_login, role, action, details) VALUES (?,?,?,?)",
+            (login or session.get("login", "?"), session.get("role", ""), action, str(details)[:500])
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 # ── Init DB ──────────────────────────────────────────────────────────────────
@@ -48,6 +134,109 @@ def _age(dn):
         return today.year - d.year - ((today.month, today.day) < (d.month, d.day))
     except Exception:
         return None
+
+# ── Sauvegarde de la base ───────────────────────────────────────────────────
+BACKUP_DIR = os.path.join(os.path.dirname(__file__), "backups")
+BACKUP_KEEP = 30  # nombre de copies conservées
+
+
+def backup_db():
+    """Copie horodatée de la base dans backups/ via l'API SQLite (fiable à chaud).
+    Rotation automatique : seules les BACKUP_KEEP copies les plus récentes sont gardées."""
+    if not os.path.exists(DB):
+        return None
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    name = f"epie_crm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    try:
+        src = sqlite3.connect(DB)
+        dst = sqlite3.connect(os.path.join(BACKUP_DIR, name))
+        src.backup(dst)
+        dst.close()
+        src.close()
+    except Exception:
+        return None
+    # Rotation
+    files = sorted(
+        f for f in os.listdir(BACKUP_DIR)
+        if f.startswith("epie_crm_") and f.endswith(".db")
+    )
+    for old in files[:-BACKUP_KEEP]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        except Exception:
+            pass
+    return name
+
+
+# ── Calendrier : jours ouvrés & jours fériés français ──────────────────────
+
+def _paques(year):
+    """Dimanche de Pâques (algorithme de Butcher, valable toute année grégorienne)."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mois, jour = divmod(h + l - 7 * m + 114, 31)
+    return date(year, mois, jour + 1)
+
+
+def jours_feries(year):
+    """Les 11 jours fériés français (métropole) pour une année donnée."""
+    p = _paques(year)
+    return {
+        date(year, 1, 1),    # Jour de l'an
+        p + timedelta(days=1),   # Lundi de Pâques
+        date(year, 5, 1),    # Fête du travail
+        date(year, 5, 8),    # Victoire 1945
+        p + timedelta(days=39),  # Ascension
+        p + timedelta(days=50),  # Lundi de Pentecôte
+        date(year, 7, 14),   # Fête nationale
+        date(year, 8, 15),   # Assomption
+        date(year, 11, 1),   # Toussaint
+        date(year, 11, 11),  # Armistice 1918
+        date(year, 12, 25),  # Noël
+    }
+
+
+def jours_ouvres(debut, fin, creneau="journee"):
+    """Nombre de jours ouvrés (lun-ven, hors fériés) entre deux dates incluses.
+    Demi-journée (matin/apm) : 0.5 si le jour est ouvré, sinon 0."""
+    try:
+        d0 = datetime.strptime(str(debut)[:10], "%Y-%m-%d").date()
+        d1 = datetime.strptime(str(fin)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return 0
+    if d1 < d0:
+        return 0
+    feries = set()
+    for y in range(d0.year, d1.year + 1):
+        feries |= jours_feries(y)
+    n = 0
+    d = d0
+    while d <= d1:
+        if d.weekday() < 5 and d not in feries:
+            n += 1
+        d += timedelta(days=1)
+    if creneau in ("matin", "apm"):
+        return 0.5 if n > 0 else 0
+    return n
+
+
+# Seuls ces types de congé décomptent le solde de congés payés
+TYPES_DECOMPTES = ("Congés payés",)
+
+
+def _conge_row(row):
+    """Enrichit une ligne congé avec le nombre de jours ouvrés calculé serveur."""
+    d = dict(row)
+    d["jours"] = jours_ouvres(d.get("debut"), d.get("fin"), d.get("creneau") or "journee")
+    return d
+
 
 def init_db():
     conn = get_db()
@@ -99,6 +288,15 @@ def init_db():
       justifiee INTEGER DEFAULT 0,
       note TEXT,
       created_at TEXT DEFAULT (datetime('now','localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT DEFAULT (datetime('now','localtime')),
+      user_login TEXT,
+      role TEXT,
+      action TEXT,
+      details TEXT
     );
     """)
 
@@ -241,14 +439,34 @@ def login_page():
 @app.route("/api/login", methods=["POST"])
 def do_login():
     d = request.json or {}
+    login = d.get("login", "").strip()
+    pw = d.get("password", "")
+    ip = request.remote_addr or "?"
+    key = f"{ip}|{login.lower()}"
+
+    minutes = _login_check(key)
+    if minutes:
+        return jsonify({"error": f"Trop de tentatives. Réessayez dans {minutes} min."}), 429
+
     conn = get_db()
-    u = conn.execute(
-        "SELECT * FROM users WHERE login=? AND password=?",
-        (d.get("login","").strip(), hash_pw(d.get("password","")))
-    ).fetchone()
-    conn.close()
-    if not u:
+    u = conn.execute("SELECT * FROM users WHERE login=?", (login,)).fetchone()
+
+    if not u or not verify_pw(u["password"], pw):
+        conn.close()
+        n = _login_fail(key)
+        audit("Connexion échouée", f"login « {login} » · IP {ip} · tentative {n}", login="—")
+        if n >= LOGIN_MAX_ATTEMPTS:
+            audit("Connexions bloquées 15 min", f"login « {login} » · IP {ip}", login="—")
         return jsonify({"error":"Identifiants incorrects"}), 401
+
+    # Migration transparente : re-hache les anciens mots de passe SHA-256 vers PBKDF2
+    if not u["password"].startswith(("pbkdf2:", "scrypt:")):
+        conn.execute("UPDATE users SET password=? WHERE id=?", (make_pw_hash(pw), u["id"]))
+        conn.commit()
+    conn.close()
+
+    _login_attempts.pop(key, None)
+    session.permanent = True
     session.update(
         user_id=u["id"],
         login=u["login"],
@@ -256,6 +474,7 @@ def do_login():
         emp_id=u["emp_id"],
         must_change_pw=u["must_change_pw"]
     )
+    audit("Connexion réussie", f"IP {ip}")
     return jsonify({
         "role": u["role"],
         "emp_id": u["emp_id"],
@@ -360,7 +579,7 @@ def get_employee(eid):
         return jsonify({"error":"Introuvable"}), 404
     emp = dict(row)
     emp["conges"] = [
-        dict(r) for r in conn.execute(
+        _conge_row(r) for r in conn.execute(
             "SELECT * FROM conges WHERE emp_id=? ORDER BY debut DESC",
             (eid,)
         ).fetchall()
@@ -440,7 +659,7 @@ def list_conges():
             ORDER BY c.id DESC
         """).fetchall()
     conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify([_conge_row(r) for r in rows])
 
 
 @app.route("/api/conges", methods=["POST"])
@@ -450,6 +669,17 @@ def add_conge():
     emp_id = session.get("emp_id") if session.get("role") == "employe" else d.get("emp_id")
     if not emp_id or not d.get("debut") or not d.get("fin"):
         return jsonify({"error":"Champs requis manquants"}), 400
+
+    # Validation des dates
+    try:
+        d0 = datetime.strptime(d["debut"], "%Y-%m-%d").date()
+        d1 = datetime.strptime(d["fin"], "%Y-%m-%d").date()
+    except Exception:
+        return jsonify({"error": "Format de date invalide"}), 400
+    if d1 < d0:
+        return jsonify({"error": "La date de fin doit être postérieure ou égale à la date de début"}), 400
+    if jours_ouvres(d["debut"], d["fin"], d.get("creneau", "journee")) <= 0:
+        return jsonify({"error": "La période ne contient aucun jour ouvré (week-end ou jour férié)"}), 400
 
     conn = get_db()
     cur = conn.cursor()
@@ -471,41 +701,53 @@ def add_conge():
         WHERE c.id=?
     """, (cur.lastrowid,)).fetchone()
     conn.close()
-    return jsonify(dict(row)), 201
+    return jsonify(_conge_row(row)), 201
 
 
 @app.route("/api/conges/<int:cid>", methods=["PUT"])
 @role_required("directeur","rh")
 def update_conge(cid):
     d = request.json or {}
+    new_statut = d.get("statut", "En attente")
+    if new_statut not in ("En attente", "Approuvé", "Refusé"):
+        return jsonify({"error": "Statut invalide"}), 400
+
     conn = get_db()
+    cg = conn.execute("SELECT * FROM conges WHERE id=?", (cid,)).fetchone()
+    if not cg:
+        conn.close()
+        return jsonify({"error": "Demande introuvable"}), 404
 
-    # Si approbation, déduire du solde
-    if d.get("statut") == "Approuvé":
-        cg = conn.execute("SELECT * FROM conges WHERE id=?", (cid,)).fetchone()
-        if cg and cg["statut"] == "En attente":
-            days = (datetime.strptime(cg["fin"], "%Y-%m-%d") - datetime.strptime(cg["debut"], "%Y-%m-%d")).days + 1
-            if cg["creneau"] in ("matin","apm"):
-                days = 0.5
-            conn.execute(
-                "UPDATE employees SET solde_cp = MAX(0, solde_cp - ?) WHERE id=?",
-                (days, cg["emp_id"])
-            )
+    old_statut = cg["statut"]
+    days = jours_ouvres(cg["debut"], cg["fin"], cg["creneau"] or "journee")
+    decompte = cg["type"] in TYPES_DECOMPTES  # seuls les congés payés touchent le solde
 
-    # Si refus après approbation, ré-créditer
-    existing = conn.execute("SELECT statut FROM conges WHERE id=?", (cid,)).fetchone()
-    if existing and existing["statut"] == "Approuvé" and d.get("statut") == "Refusé":
-        cg = conn.execute("SELECT * FROM conges WHERE id=?", (cid,)).fetchone()
-        if cg:
-            days = (datetime.strptime(cg["fin"], "%Y-%m-%d") - datetime.strptime(cg["debut"], "%Y-%m-%d")).days + 1
-            conn.execute(
-                "UPDATE employees SET solde_cp = solde_cp + ? WHERE id=?",
-                (days, cg["emp_id"])
-            )
+    # Passage vers Approuvé : contrôle du solde puis déduction
+    if decompte and old_statut != "Approuvé" and new_statut == "Approuvé":
+        row = conn.execute(
+            "SELECT solde_cp FROM employees WHERE id=?", (cg["emp_id"],)
+        ).fetchone()
+        solde = (row["solde_cp"] or 0) if row else 0
+        if days > solde:
+            conn.close()
+            return jsonify({
+                "error": f"Solde insuffisant : {solde} j restants, demande de {days} j ouvrés"
+            }), 409
+        conn.execute(
+            "UPDATE employees SET solde_cp = solde_cp - ? WHERE id=?",
+            (days, cg["emp_id"])
+        )
+
+    # Sortie du statut Approuvé (refus ou remise en attente) : re-crédit exact
+    if decompte and old_statut == "Approuvé" and new_statut != "Approuvé":
+        conn.execute(
+            "UPDATE employees SET solde_cp = solde_cp + ? WHERE id=?",
+            (days, cg["emp_id"])
+        )
 
     conn.execute(
         "UPDATE conges SET statut=?, note_refus=? WHERE id=?",
-        (d.get("statut","En attente"), d.get("note_refus",""), cid)
+        (new_statut, d.get("note_refus", ""), cid)
     )
     conn.commit()
     row = conn.execute("""
@@ -514,7 +756,12 @@ def update_conge(cid):
         WHERE c.id=?
     """, (cid,)).fetchone()
     conn.close()
-    return jsonify(dict(row))
+    if new_statut != old_statut and new_statut in ("Approuvé", "Refusé"):
+        audit(
+            "Congé approuvé" if new_statut == "Approuvé" else "Congé refusé",
+            f"{row['emp_nom']} · {row['type']} {row['debut']} → {row['fin']} · {days} j ouvrés"
+        )
+    return jsonify(_conge_row(row))
 
 
 # ── Absences ────────────────────────────────────────────────────────────────
@@ -633,7 +880,7 @@ def dashboard():
 
     # Congés en attente
     pending = [
-        dict(r) for r in conn.execute("""
+        _conge_row(r) for r in conn.execute("""
             SELECT c.*, e.prenom||' '||e.nom AS emp_nom
             FROM conges c JOIN employees e ON e.id=c.emp_id
             WHERE c.statut='En attente'
@@ -714,7 +961,7 @@ def add_user():
             VALUES (?,?,?,?,1)
         """, (
             d["login"],
-            hash_pw(d["password"]),
+            make_pw_hash(d["password"]),
             d.get("role","employe"),
             d.get("emp_id") or None
         ))
@@ -723,6 +970,7 @@ def add_user():
         conn.close()
         return jsonify({"error":"Login déjà existant"}), 400
     conn.close()
+    audit("Compte créé", f"login « {d['login']} » · rôle {d.get('role','employe')}")
     return jsonify({"ok":True}), 201
 
 
@@ -731,23 +979,37 @@ def add_user():
 def update_user(uid):
     d = request.json or {}
     conn = get_db()
+    target = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not target:
+        conn.close()
+        return jsonify({"error":"Compte introuvable"}), 404
+    new_role = d.get("role","employe")
+    # Protection : ne pas rétrograder le dernier compte directeur
+    if target["role"] == "directeur" and new_role != "directeur":
+        nb = conn.execute("SELECT COUNT(*) FROM users WHERE role='directeur'").fetchone()[0]
+        if nb <= 1:
+            conn.close()
+            return jsonify({"error":"Impossible de retirer le rôle du dernier compte directeur"}), 400
     if d.get("password"):
         conn.execute("""
             UPDATE users SET role=?, emp_id=?, password=?, must_change_pw=1
             WHERE id=?
         """, (
-            d.get("role","employe"), d.get("emp_id") or None,
-            hash_pw(d["password"]), uid
+            new_role, d.get("emp_id") or None,
+            make_pw_hash(d["password"]), uid
         ))
     else:
         conn.execute("""
             UPDATE users SET role=?, emp_id=?
             WHERE id=?
         """, (
-            d.get("role","employe"), d.get("emp_id") or None, uid
+            new_role, d.get("emp_id") or None, uid
         ))
     conn.commit()
     conn.close()
+    audit("Compte modifié",
+          f"login « {target['login']} » · rôle {new_role}"
+          + (" · mot de passe réinitialisé" if d.get("password") else ""))
     return jsonify({"ok":True})
 
 
@@ -755,9 +1017,22 @@ def update_user(uid):
 @role_required("directeur")
 def delete_user(uid):
     conn = get_db()
+    target = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not target:
+        conn.close()
+        return jsonify({"error":"Compte introuvable"}), 404
+    if target["id"] == session.get("user_id"):
+        conn.close()
+        return jsonify({"error":"Impossible de supprimer votre propre compte"}), 400
+    if target["role"] == "directeur":
+        nb = conn.execute("SELECT COUNT(*) FROM users WHERE role='directeur'").fetchone()[0]
+        if nb <= 1:
+            conn.close()
+            return jsonify({"error":"Impossible de supprimer le dernier compte directeur"}), 400
     conn.execute("DELETE FROM users WHERE id=?", (uid,))
     conn.commit()
     conn.close()
+    audit("Compte supprimé", f"login « {target['login']} » · rôle {target['role']}")
     return jsonify({"ok":True})
 
 
@@ -765,21 +1040,47 @@ def delete_user(uid):
 @login_required
 def change_password():
     d = request.json or {}
+    if not d.get("new_password") or len(d["new_password"]) < 8:
+        return jsonify({"error":"Le nouveau mot de passe doit contenir au moins 8 caractères"}), 400
     conn = get_db()
-    u = conn.execute(
-        "SELECT * FROM users WHERE id=? AND password=?",
-        (session["user_id"], hash_pw(d.get("old_password","")))
-    ).fetchone()
-    if not u:
+    u = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    if not u or not verify_pw(u["password"], d.get("old_password","")):
         conn.close()
         return jsonify({"error":"Ancien mot de passe incorrect"}), 400
     conn.execute(
         "UPDATE users SET password=?, must_change_pw=0 WHERE id=?",
-        (hash_pw(d["new_password"]), session["user_id"])
+        (make_pw_hash(d["new_password"]), session["user_id"])
     )
     conn.commit()
     conn.close()
+    session["must_change_pw"] = 0
+    audit("Mot de passe modifié", "changement par l'utilisateur")
     return jsonify({"ok":True})
+
+
+# ── Sauvegarde manuelle (bouton Directeur) ──────────────────────────────────
+
+@app.route("/api/backup", methods=["POST"])
+@role_required("directeur")
+def api_backup():
+    name = backup_db()
+    if not name:
+        return jsonify({"error": "Sauvegarde impossible (base introuvable ou erreur d'écriture)"}), 500
+    audit("Sauvegarde de la base", name)
+    return jsonify({"ok": True, "fichier": name})
+
+
+# ── Journal d'audit (consultation) ──────────────────────────────────────────
+
+@app.route("/api/audit")
+@role_required("directeur")
+def list_audit():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT 500"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 # ── Export / Import Excel ───────────────────────────────────────────────────
@@ -830,16 +1131,17 @@ def export_excel():
 
     # Congés
     ws2 = wb.create_sheet("Congés")
-    sh(ws2, ["ID","Collaborateur","Type","Créneau","Du","Au","Jours","Motif","Statut","Note refus","Soumis le"])
+    sh(ws2, ["ID","Collaborateur","Type","Créneau","Du","Au","Jours ouvrés","Motif","Statut","Note refus","Soumis le"])
     for r in conn.execute("""
         SELECT c.id, e.prenom||' '||e.nom, c.type, c.creneau,
                c.debut, c.fin,
-               (julianday(c.fin)-julianday(c.debut)+1),
                c.motif, c.statut, c.note_refus, c.created_at
         FROM conges c JOIN employees e ON e.id=c.emp_id
         ORDER BY c.id DESC
     """).fetchall():
-        ws2.append(list(r))
+        vals = list(r)
+        jo = jours_ouvres(vals[4], vals[5], vals[3] or "journee")
+        ws2.append(vals[:6] + [jo] + vals[6:])
     sr(ws2)
     for col,w in zip("ABCDEFGHIJK",[6,20,16,10,12,12,7,20,12,24,16]):
         ws2.column_dimensions[col].width = w
@@ -1091,4 +1393,5 @@ def import_conges_absences():
 
 if __name__ == "__main__":
     init_db()
+    backup_db()  # sauvegarde automatique à chaque démarrage
     app.run(host="0.0.0.0", port=5000, debug=False)
